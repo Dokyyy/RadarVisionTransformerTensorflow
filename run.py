@@ -2,9 +2,23 @@ import tensorflow as tf
 import numpy as np
 from configuration import *
 from convGen import *
+from convCritic import *
 from dataloader import *
+import time
 
-model = ConvGen(
+generator = ConvGen(
+    image_size=256,
+    patch_size=32,
+    num_classes=1000,
+    dim=1024,
+    depth=6,
+    heads=16,
+    mlp_dim=2048,
+    dropout=0.1,
+    emb_dropout=0.1
+)
+
+discriminator = ConvCritic(
     image_size=256,
     patch_size=32,
     num_classes=1000,
@@ -30,23 +44,67 @@ model = ConvGen(
 pixel_mse = tf.keras.losses.MeanSquaredError()
 pixel_opt = tf.keras.optimizers.Adam(learning_rate=.0001)
 
-train_loss = tf.keras.metrics.Mean(name='train_loss')
-train_accuracy = tf.keras.metrics.SparseCategoricalAccuracy(name='train_accuracy')
-test_loss = tf.keras.metrics.Mean(name='test_loss')
-test_accuracy = tf.keras.metrics.SparseCategoricalAccuracy(name='test_accuracy')
+generator_loss = tf.keras.losses.BinaryCrossentropy(from_logits=True)
+generator_optimizer = tf.keras.optimizers.Adam(learning_rate=.0001)
+discriminator_loss = tf.keras.losses.BinaryCrossentropy(from_logits=True)
+discriminator_optimizer = tf.keras.optimizers.Adam(learning_rate=.0001)
+
+
+pix_loss_metric = tf.keras.metrics.Mean(name='pixel_loss')
+gen_loss_metric = tf.keras.metrics.BinaryCrossentropy(from_logits=True, name='generator_loss')
+dis_loss_metric = tf.keras.metrics.BinaryCrossentropy(from_logits=True, name='discriminator_loss')
 
 
 @tf.function
-def conv_gen_train_step(inputs, output):
+def conv_gen_pixel_train_step(inputs, output):
     with tf.GradientTape() as tape:
-        prediction = model(inputs)
+        prediction = generator(inputs)
         pix_loss = pixel_mse(output, prediction)
 
-    gradients = tape.gradient(pix_loss, model.trainable_variables)
-    pixel_opt.apply_gradients(zip(gradients, model.trainable_variables))
+    gradients = tape.gradient(pix_loss, generator.trainable_variables)
+    pixel_opt.apply_gradients(zip(gradients, generator.trainable_variables))
 
-    train_loss(pix_loss)
-    # train_accuracy(output, prediction)
+    pix_loss_metric(pix_loss)
+    return prediction
+
+
+@tf.function
+def conv_generator_train_step(inputs, trg_img=None):
+    with tf.GradientTape() as tape:
+        prediction = generator(inputs)
+        dis_input = tf.keras.layers.concatenate((inputs, prediction), axis=-1)
+        pred_class = discriminator(dis_input)
+        gen_loss = generator_loss(tf.ones_like(pred_class), pred_class)
+
+    gradients = tape.gradient(gen_loss, generator.trainable_variables)
+    generator_optimizer.apply_gradients(zip(gradients, generator.trainable_variables))
+
+    gen_loss_metric(tf.ones_like(pred_class), pred_class)
+    return prediction
+
+
+@tf.function
+def conv_discriminator_train_step(inputs, trg_img):
+    with tf.GradientTape() as tape:
+        prediction = generator(inputs)
+        dis_input = tf.keras.layers.concatenate((inputs, prediction), axis=-1)
+        pred_class = discriminator(dis_input)
+        dis_loss = discriminator_loss(tf.zeros_like(pred_class), pred_class)
+
+    gradients = tape.gradient(dis_loss, discriminator.trainable_variables)
+    discriminator_optimizer.apply_gradients(zip(gradients, discriminator.trainable_variables))
+
+    dis_loss_metric(tf.zeros_like(pred_class), pred_class)
+
+    with tf.GradientTape() as tape:
+        dis_input_1 = tf.keras.layers.concatenate((inputs, trg_img), axis=-1)
+        pred_class_1 = discriminator(dis_input_1)
+        dis_loss_1 = discriminator_loss(tf.ones_like(pred_class_1), pred_class_1)
+
+    gradients = tape.gradient(dis_loss_1, discriminator.trainable_variables)
+    discriminator_optimizer.apply_gradients(zip(gradients, discriminator.trainable_variables))
+
+    dis_loss_metric(tf.ones_like(pred_class_1), pred_class_1)
     return prediction
 
 
@@ -67,17 +125,26 @@ def plot(out, name):
     plt.show()
 
 
-while True:
+start = time.time()
+for epoch in range(EPOCHS):
+    batch = np.expand_dims(loader.get_batch()[:,:,:,0], axis=-1)
+    trg = np.expand_dims(eo_loader.get_batch()[:,:,:,0], axis=-1)
 
-    batch_num = 0
-    batch = loader.get_batch()
-    trg = eo_loader.get_batch()
+    output_img = np.array(conv_generator_train_step(batch, trg))
+    output_img = conv_discriminator_train_step(batch, trg)
 
-    output_img = np.array(conv_gen_train_step(batch, trg))
-
-    if batch_num % 10 == 0:
+    if epoch % 10 == 0:
+        print(
+            f'Epoch : {epoch + 1}, '
+            f'Generator Loss : {gen_loss_metric.result()}, '
+            f'Discriminator Loss: {gen_loss_metric.result()}, '
+            f'Runtime : {time.time() - start}, '
+        )
         plot(output_img[0,:,:,0], 'output')
         plot(trg[0,:,:,0], 'target')
-    batch_num += 1
 
+        # reset statistical measures
+        start = time.time()
+        gen_loss_metric.reset_states()
+        dis_loss_metric.reset_states()
 
